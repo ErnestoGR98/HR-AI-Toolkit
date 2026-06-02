@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect } from "react";
+import { getHistory, saveItem, deleteItem, clearHistory } from "../lib/storage";
 
 // ─── Markdown-like renderer (lightweight, no deps) ───
 function renderMarkdown(text) {
@@ -116,6 +117,63 @@ function CopyButton({ text, label = "Copiar todo" }) {
   );
 }
 
+// ─── Save-to-history button ───
+function SaveButton({ onSave, label = "Guardar en historial" }) {
+  const [state, setState] = useState("idle"); // idle | saving | saved | error
+
+  const handleSave = async () => {
+    setState("saving");
+    try {
+      await onSave();
+      setState("saved");
+      setTimeout(() => setState("idle"), 2000);
+    } catch {
+      setState("error");
+      setTimeout(() => setState("idle"), 3000);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleSave}
+      disabled={state === "saving" || state === "saved"}
+      className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border transition-all duration-200 cursor-pointer
+        bg-white border-gray-300 text-gray-700 hover:bg-gray-50 active:bg-gray-100 disabled:cursor-default"
+    >
+      {state === "saved" ? (
+        <>
+          <CheckIcon />
+          <span>Guardado</span>
+        </>
+      ) : state === "saving" ? (
+        <>
+          <SpinnerIcon />
+          <span>Guardando...</span>
+        </>
+      ) : state === "error" ? (
+        <span className="text-red-600">Error al guardar</span>
+      ) : (
+        <>
+          <SaveIcon />
+          <span>{label}</span>
+        </>
+      )}
+    </button>
+  );
+}
+
+// ─── Date formatter ───
+function formatDate(ts) {
+  try {
+    return new Date(ts).toLocaleString("es-MX", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  } catch {
+    return new Date(ts).toLocaleString();
+  }
+}
+
 // ─── Icons (inline SVG) ───
 function ClipboardIcon() {
   return (
@@ -195,6 +253,33 @@ function PlayIcon() {
   );
 }
 
+function SaveIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+        d="M5 5a2 2 0 012-2h8l4 4v10a2 2 0 01-2 2H7a2 2 0 01-2-2V5z M9 3v4h6 M9 21v-6h6v6" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+        d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+    </svg>
+  );
+}
+
+function HistoryIcon() {
+  return (
+    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+        d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+  );
+}
+
 // ─── Timer formatter ───
 function formatTime(seconds) {
   const m = Math.floor(seconds / 60).toString().padStart(2, "0");
@@ -202,8 +287,10 @@ function formatTime(seconds) {
   return `${m}:${s}`;
 }
 
-// ─── API call helper ───
-async function callHRApi(action, payload) {
+// ─── API call helper (streaming) ───
+// Calls /api/hr and streams the text back, invoking onText with the
+// accumulated string as each chunk arrives. Returns the full text.
+async function streamHRApi(action, payload, onText) {
   const res = await fetch("/api/hr", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -215,7 +302,16 @@ async function callHRApi(action, payload) {
     throw new Error(err.error || `Error ${res.status}`);
   }
 
-  return res.json();
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let acc = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    acc += decoder.decode(value, { stream: true });
+    if (onText) onText(acc);
+  }
+  return acc;
 }
 
 // ═══════════════════════════════════════════════════
@@ -249,11 +345,16 @@ function JobDescriptionModule({ onUseForInterview }) {
     }
     setError("");
     setLoading(true);
+    setIsEditing(false);
+    setResult("");
+    setEditableResult("");
     try {
-      const { result: text } = await callHRApi("generate_description", form);
+      const text = await streamHRApi("generate_description", form, (partial) => {
+        setResult(partial);
+        setEditableResult(partial);
+      });
       setResult(text);
       setEditableResult(text);
-      setIsEditing(false);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -427,6 +528,16 @@ function JobDescriptionModule({ onUseForInterview }) {
                 {isEditing ? "Guardar cambios" : "Editar"}
               </button>
               <CopyButton text={displayedText} />
+              <SaveButton
+                onSave={() =>
+                  saveItem({
+                    type: "description",
+                    title: form.jobTitle || "Descripción de puesto",
+                    content: displayedText,
+                    meta: { jobTitle: form.jobTitle, location: form.location },
+                  })
+                }
+              />
               <button
                 onClick={() => onUseForInterview(displayedText)}
                 className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border transition-all duration-200 cursor-pointer
@@ -468,10 +579,13 @@ function InterviewModule({ initialDescription }) {
   const [loadingVerdict, setLoadingVerdict] = useState(false);
   const [error, setError] = useState("");
 
-  // Sync when parent passes new description
-  const prevDesc = useState(initialDescription)[0];
-  if (initialDescription !== prevDesc && initialDescription) {
-    setJobDescription(initialDescription);
+  // Sync when parent passes a new description. Official React "adjust state on
+  // prop change during render" pattern — we MUST update prevDesc, otherwise the
+  // condition stays true forever and React throws "Too many re-renders".
+  const [prevDesc, setPrevDesc] = useState(initialDescription);
+  if (initialDescription !== prevDesc) {
+    setPrevDesc(initialDescription);
+    if (initialDescription) setJobDescription(initialDescription);
   }
 
   const handleGenerateQuestions = async () => {
@@ -481,13 +595,15 @@ function InterviewModule({ initialDescription }) {
     }
     setError("");
     setLoadingQuestions(true);
+    setQuestions("");
+    setVerdict("");
+    setNotes("");
     try {
-      const { result: text } = await callHRApi("generate_questions", {
-        jobDescription,
-      });
-      setQuestions(text);
-      setVerdict("");
-      setNotes("");
+      await streamHRApi(
+        "generate_questions",
+        { jobDescription },
+        (partial) => setQuestions(partial)
+      );
     } catch (e) {
       setError(e.message);
     } finally {
@@ -502,12 +618,13 @@ function InterviewModule({ initialDescription }) {
     }
     setError("");
     setLoadingVerdict(true);
+    setVerdict("");
     try {
-      const { result: text } = await callHRApi("generate_verdict", {
-        jobDescription,
-        notes,
-      });
-      setVerdict(text);
+      await streamHRApi(
+        "generate_verdict",
+        { jobDescription, notes },
+        (partial) => setVerdict(partial)
+      );
     } catch (e) {
       setError(e.message);
     } finally {
@@ -611,7 +728,21 @@ function InterviewModule({ initialDescription }) {
             <h3 className="text-lg font-semibold text-gray-900">
               Dictamen ejecutivo
             </h3>
-            <CopyButton text={verdict} />
+            <div className="flex flex-wrap gap-2">
+              <CopyButton text={verdict} />
+              <SaveButton
+                onSave={() =>
+                  saveItem({
+                    type: "interview",
+                    title:
+                      "Dictamen: " +
+                      (jobDescription.split("\n")[0].slice(0, 40) || "Entrevista"),
+                    content: verdict,
+                    meta: { jobDescription, questions, notes },
+                  })
+                }
+              />
+            </div>
           </div>
           <div className="prose prose-sm max-w-none">
             {renderMarkdown(verdict)}
@@ -661,10 +792,13 @@ function AudioRecorderModule({ initialDescription }) {
   const streamRef = useRef(null);
   const audioBlobRef = useRef(null);
 
-  // Sync description from parent
-  const prevDesc = useState(initialDescription)[0];
-  if (initialDescription !== prevDesc && initialDescription) {
-    setJobDescription(initialDescription);
+  // Sync description from parent. Official React "adjust state on prop change
+  // during render" pattern — we MUST update prevDesc, otherwise the condition
+  // stays true forever and React throws "Too many re-renders".
+  const [prevDesc, setPrevDesc] = useState(initialDescription);
+  if (initialDescription !== prevDesc) {
+    setPrevDesc(initialDescription);
+    if (initialDescription) setJobDescription(initialDescription);
   }
 
   // Check browser + Whisper support
@@ -705,8 +839,22 @@ function AudioRecorderModule({ initialDescription }) {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      // MediaRecorder for audio file
-      const mediaRecorder = new MediaRecorder(stream);
+      // MediaRecorder for audio file. Pick a mime type the browser actually
+      // supports — Safari records audio/mp4, Chrome/Edge prefer audio/webm.
+      // Hardcoding webm produced corrupt/unplayable files on Safari.
+      const preferredTypes = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+        "audio/ogg;codecs=opus",
+      ];
+      let chosenType = "";
+      if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported) {
+        chosenType = preferredTypes.find((t) => MediaRecorder.isTypeSupported(t)) || "";
+      }
+      const mediaRecorder = chosenType
+        ? new MediaRecorder(stream, { mimeType: chosenType })
+        : new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
       chunksRef.current = [];
 
@@ -715,7 +863,8 @@ function AudioRecorderModule({ initialDescription }) {
       };
 
       mediaRecorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        const type = mediaRecorder.mimeType || chosenType || "audio/webm";
+        const blob = new Blob(chunksRef.current, { type });
         audioBlobRef.current = blob;
         setAudioURL(URL.createObjectURL(blob));
       };
@@ -841,14 +990,18 @@ function AudioRecorderModule({ initialDescription }) {
     }
     setError("");
     setLoadingAnalysis(true);
+    setAnalysis("");
     try {
-      const { result: text } = await callHRApi("analyze_interview", {
-        jobDescription: jobDescription || "(No se proporciono descripcion de puesto)",
-        candidateName: candidateName || "Candidato",
-        transcript,
-        interviewerNotes,
-      });
-      setAnalysis(text);
+      await streamHRApi(
+        "analyze_interview",
+        {
+          jobDescription: jobDescription || "(No se proporciono descripcion de puesto)",
+          candidateName: candidateName || "Candidato",
+          transcript,
+          interviewerNotes,
+        },
+        (partial) => setAnalysis(partial)
+      );
     } catch (e) {
       setError(e.message);
     } finally {
@@ -864,8 +1017,18 @@ function AudioRecorderModule({ initialDescription }) {
     setError("");
     setTranscribing(true);
     try {
+      const blob = audioBlobRef.current;
+      const blobType = blob.type || "audio/webm";
+      const ext = blobType.includes("mp4")
+        ? "mp4"
+        : blobType.includes("ogg")
+        ? "ogg"
+        : blobType.includes("wav")
+        ? "wav"
+        : "webm";
+
       const formData = new FormData();
-      formData.append("file", audioBlobRef.current, "interview.webm");
+      formData.append("file", blob, `interview.${ext}`);
       formData.append("language", "es");
       if (diarize) formData.append("diarize", "true");
 
@@ -1167,11 +1330,212 @@ function AudioRecorderModule({ initialDescription }) {
             <h3 className="text-lg font-semibold text-gray-900">
               Analisis de la entrevista
             </h3>
-            <CopyButton text={analysis} />
+            <div className="flex flex-wrap gap-2">
+              <CopyButton text={analysis} />
+              <SaveButton
+                onSave={() =>
+                  saveItem({
+                    type: "analysis",
+                    title: candidateName || "Análisis de entrevista",
+                    content: analysis,
+                    meta: { candidateName, jobDescription, transcript },
+                  })
+                }
+              />
+            </div>
           </div>
           <div className="prose prose-sm max-w-none">
             {renderMarkdown(analysis)}
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════
+// MODULE 4: History (saved items)
+// ═══════════════════════════════════════════════════
+const TYPE_META = {
+  description: { label: "Descripción", color: "bg-blue-100 text-blue-700" },
+  interview: { label: "Entrevista", color: "bg-emerald-100 text-emerald-700" },
+  analysis: { label: "Análisis", color: "bg-purple-100 text-purple-700" },
+  other: { label: "Otro", color: "bg-gray-100 text-gray-600" },
+};
+
+function HistoryModule({ active, onUseForInterview }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [filter, setFilter] = useState("all");
+  const [expandedId, setExpandedId] = useState(null);
+  const [error, setError] = useState("");
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setItems(await getHistory());
+    } catch {
+      setError("No se pudo cargar el historial.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Refresh each time the tab becomes active so newly saved items appear.
+  useEffect(() => {
+    if (active) reload();
+  }, [active, reload]);
+
+  const handleDelete = async (id) => {
+    try {
+      const updated = await deleteItem(id);
+      setItems(updated);
+    } catch {
+      setError("No se pudo borrar el elemento.");
+    }
+  };
+
+  const handleClear = async () => {
+    if (!window.confirm("¿Borrar TODO el historial? Esta acción no se puede deshacer.")) return;
+    try {
+      await clearHistory();
+      setItems([]);
+    } catch {
+      setError("No se pudo limpiar el historial.");
+    }
+  };
+
+  const filtered = filter === "all" ? items : items.filter((i) => i.type === filter);
+
+  const filterButtons = [
+    { id: "all", label: "Todos" },
+    { id: "description", label: "Descripciones" },
+    { id: "interview", label: "Entrevistas" },
+    { id: "analysis", label: "Análisis" },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900">Historial</h3>
+            <p className="text-sm text-gray-500 mt-0.5">
+              Tus elementos guardados se almacenan en el servidor (data/history.json) y no se pierden al limpiar el navegador.
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={reload}
+              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 cursor-pointer"
+            >
+              Actualizar
+            </button>
+            {items.length > 0 && (
+              <button
+                onClick={handleClear}
+                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-red-200 text-red-600 hover:bg-red-50 cursor-pointer"
+              >
+                <TrashIcon />
+                Borrar todo
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Filters */}
+        <div className="flex flex-wrap gap-2 mb-2">
+          {filterButtons.map((f) => (
+            <button
+              key={f.id}
+              onClick={() => setFilter(f.id)}
+              className={`px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors cursor-pointer ${
+                filter === f.id
+                  ? "border-blue-600 bg-blue-50 text-blue-700"
+                  : "border-gray-200 text-gray-600 hover:bg-gray-50"
+              }`}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+
+        {error && (
+          <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+            {error}
+          </div>
+        )}
+      </div>
+
+      {/* List */}
+      {loading ? (
+        <div className="flex items-center justify-center gap-2 py-12 text-gray-500">
+          <SpinnerIcon />
+          Cargando historial...
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="bg-white rounded-xl border border-dashed border-gray-300 p-10 text-center">
+          <p className="text-gray-500">
+            {items.length === 0
+              ? "Aún no has guardado nada. Usa el botón \"Guardar en historial\" en cualquier resultado."
+              : "No hay elementos de este tipo."}
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {filtered.map((item) => {
+            const meta = TYPE_META[item.type] || TYPE_META.other;
+            const isOpen = expandedId === item.id;
+            return (
+              <div
+                key={item.id}
+                className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden"
+              >
+                <div className="flex items-center justify-between gap-3 p-4">
+                  <button
+                    onClick={() => setExpandedId(isOpen ? null : item.id)}
+                    className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer"
+                  >
+                    <span className={`shrink-0 px-2 py-0.5 text-xs font-medium rounded-full ${meta.color}`}>
+                      {meta.label}
+                    </span>
+                    <span className="font-medium text-gray-900 truncate">{item.title}</span>
+                    <span className="shrink-0 text-xs text-gray-400 hidden sm:inline">
+                      {formatDate(item.date)}
+                    </span>
+                  </button>
+                  <div className="flex shrink-0 gap-2">
+                    {item.type === "description" && (
+                      <button
+                        onClick={() => onUseForInterview(item.content)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 cursor-pointer"
+                      >
+                        <ChatIcon />
+                        Usar
+                      </button>
+                    )}
+                    <button
+                      onClick={() => handleDelete(item.id)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-200 text-gray-500 hover:bg-red-50 hover:text-red-600 hover:border-red-200 cursor-pointer"
+                    >
+                      <TrashIcon />
+                    </button>
+                  </div>
+                </div>
+                {isOpen && (
+                  <div className="border-t border-gray-100 p-5 bg-gray-50/50">
+                    <div className="flex justify-end mb-3">
+                      <CopyButton text={item.content} />
+                    </div>
+                    <div className="prose prose-sm max-w-none">
+                      {renderMarkdown(item.content)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -1194,6 +1558,7 @@ export default function HRToolkit() {
     { id: "description", label: "Descripcion de Puesto", icon: <BriefcaseIcon /> },
     { id: "interview", label: "Entrevista", icon: <ChatIcon /> },
     { id: "recording", label: "Grabacion", icon: <MicIcon /> },
+    { id: "history", label: "Historial", icon: <HistoryIcon /> },
   ];
 
   return (
@@ -1249,6 +1614,12 @@ export default function HRToolkit() {
         <div className={activeTab === "recording" ? "" : "hidden"}>
           <AudioRecorderModule
             initialDescription={interviewDescription}
+          />
+        </div>
+        <div className={activeTab === "history" ? "" : "hidden"}>
+          <HistoryModule
+            active={activeTab === "history"}
+            onUseForInterview={handleUseForInterview}
           />
         </div>
       </main>

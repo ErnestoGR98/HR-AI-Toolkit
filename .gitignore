@@ -26,3 +26,6 @@ yarn-error.log*
 .DS_Store
 *.tsbuildinfo
 next-env.d.ts
+
+# local HR data (saved history — contains candidate info, keep private)
+data/

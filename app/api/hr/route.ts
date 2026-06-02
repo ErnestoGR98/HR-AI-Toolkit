@@ -87,17 +87,41 @@ export async function POST(request: NextRequest) {
       userMessage = parts.join("\n\n");
     }
 
-    const message = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+    // Stream the response so the UI can render text as it's generated instead
+    // of waiting for the full (often 3-4k token) completion.
+    const llmStream = anthropic.messages.stream({
+      model: "claude-sonnet-4-6",
       max_tokens: 4096,
       system: SYSTEM_PROMPTS[action],
       messages: [{ role: "user", content: userMessage }],
     });
 
-    const textBlock = message.content.find((block) => block.type === "text");
-    const result = textBlock ? textBlock.text : "";
+    const encoder = new TextEncoder();
+    const readable = new ReadableStream({
+      async start(controller) {
+        try {
+          for await (const event of llmStream) {
+            if (
+              event.type === "content_block_delta" &&
+              event.delta.type === "text_delta"
+            ) {
+              controller.enqueue(encoder.encode(event.delta.text));
+            }
+          }
+        } catch (err) {
+          controller.error(err);
+          return;
+        }
+        controller.close();
+      },
+    });
 
-    return NextResponse.json({ result });
+    return new Response(readable, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+      },
+    });
   } catch (error: unknown) {
     console.error("HR API error:", error);
     const errMsg =

@@ -49,8 +49,12 @@ async function transcribeWithDeepgram(
 
   const buffer = Buffer.from(await file.arrayBuffer());
 
+  // nova-3 diarization is unreliable for non-English audio; nova-2 has solid
+  // Spanish diarization. Use nova-2 for anything that isn't English.
+  const model = language.startsWith("en") ? "nova-3" : "nova-2";
+
   const url = new URL("https://api.deepgram.com/v1/listen");
-  url.searchParams.set("model", "nova-3");
+  url.searchParams.set("model", model);
   url.searchParams.set("language", language);
   url.searchParams.set("punctuate", "true");
   url.searchParams.set("diarize", "true");
@@ -73,24 +77,65 @@ async function transcribeWithDeepgram(
   }
 
   const data = await res.json();
+  const alt = data?.results?.channels?.[0]?.alternatives?.[0];
 
-  // Format with speaker labels
-  const paragraphs =
-    data?.results?.channels?.[0]?.alternatives?.[0]?.paragraphs?.paragraphs;
+  const labels = ["Hablante 1", "Hablante 2", "Hablante 3", "Hablante 4", "Hablante 5"];
+  const nameFor = (speakerNames: Record<number, string>, counter: { n: number }, id: number) => {
+    if (!(id in speakerNames)) {
+      speakerNames[id] = labels[counter.n] || `Hablante ${counter.n + 1}`;
+      counter.n++;
+    }
+    return speakerNames[id];
+  };
 
-  if (paragraphs && paragraphs.length > 0) {
-    // Map speaker IDs to friendly names
+  // Primary: reconstruct speaker turns from the words array. Every word carries
+  // a `speaker` id when diarize=true, so this is the most reliable source.
+  const words: { punctuated_word?: string; word: string; speaker?: number }[] =
+    alt?.words || [];
+
+  const distinctSpeakers = new Set(
+    words.map((w) => w.speaker).filter((s) => s !== undefined)
+  );
+  console.log(
+    `Deepgram diarization: model=${model}, words=${words.length}, distinct speakers=${distinctSpeakers.size}`
+  );
+
+  if (words.length > 0 && words.some((w) => w.speaker !== undefined)) {
     const speakerNames: Record<number, string> = {};
-    let speakerCount = 0;
-    const labels = ["Hablante 1", "Hablante 2", "Hablante 3", "Hablante 4", "Hablante 5"];
+    const counter = { n: 0 };
+    const turns: string[] = [];
+    let current: number | null = null;
+    let buf: string[] = [];
 
+    const flush = () => {
+      if (buf.length > 0 && current !== null) {
+        turns.push(`**${nameFor(speakerNames, counter, current)}:** ${buf.join(" ")}`);
+        buf = [];
+      }
+    };
+
+    for (const w of words) {
+      const spk = w.speaker ?? 0;
+      if (current === null) current = spk;
+      if (spk !== current) {
+        flush();
+        current = spk;
+      }
+      buf.push(w.punctuated_word || w.word);
+    }
+    flush();
+
+    if (turns.length > 0) return turns.join("\n\n");
+  }
+
+  // Secondary: paragraph-level speaker labels.
+  const paragraphs = alt?.paragraphs?.paragraphs;
+  if (paragraphs && paragraphs.length > 0) {
+    const speakerNames: Record<number, string> = {};
+    const counter = { n: 0 };
     return paragraphs
       .map((p: { speaker: number; sentences: { text: string }[] }) => {
-        if (!(p.speaker in speakerNames)) {
-          speakerNames[p.speaker] = labels[speakerCount] || `Hablante ${speakerCount + 1}`;
-          speakerCount++;
-        }
-        const name = speakerNames[p.speaker];
+        const name = nameFor(speakerNames, counter, p.speaker);
         const text = p.sentences.map((s: { text: string }) => s.text).join(" ");
         return `**${name}:** ${text}`;
       })
@@ -98,9 +143,7 @@ async function transcribeWithDeepgram(
   }
 
   // Fallback to plain transcript
-  const plain =
-    data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
-  return plain;
+  return alt?.transcript || "";
 }
 
 // ─── Groq/OpenAI transcription (no diarization) ───
