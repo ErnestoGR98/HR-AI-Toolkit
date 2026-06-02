@@ -195,6 +195,22 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Reject non-audio uploads and oversized files to avoid abuse / wasted
+    // transcription credits. 25 MB matches the server-action body limit.
+    const MAX_BYTES = 25 * 1024 * 1024;
+    if (file.type && !file.type.startsWith("audio/")) {
+      return NextResponse.json(
+        { error: "El archivo debe ser de audio." },
+        { status: 400 }
+      );
+    }
+    if (file.size > MAX_BYTES) {
+      return NextResponse.json(
+        { error: "El audio supera el límite de 25 MB." },
+        { status: 413 }
+      );
+    }
+
     const language = (formData.get("language") as string) || "es";
     const diarize = formData.get("diarize") === "true";
 
